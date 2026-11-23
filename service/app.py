@@ -14,6 +14,9 @@ from typing import Any, Literal, Optional
 
 import hmac
 import os
+import threading
+import time
+from collections import deque
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +28,52 @@ from . import policies, simulate, training
 from .gym2 import ACTUATORS, version_info, weather_catalog
 
 app = FastAPI(title="Splatto Simulation Lab", version="0.1.0")
+
+# Hosted on Cloud Run (K_SERVICE is set there) the engine must have its key: refuse to start open.
+if os.environ.get("K_SERVICE") and not os.environ.get("SIM_LAB_KEY"):
+    raise RuntimeError("SIM_LAB_KEY is not set: the hosted engine would answer anyone. Set it and redeploy.")
+
+
+class RateLimiter:
+    """
+    Simulations per caller (Splatto's server names the caller in x-simulation-client: the signed-in
+    user, or the share link plus the visitor's address) and per day for this instance. Cloud Run runs
+    at most two instances, so the daily total is at most twice the limit.
+    """
+
+    def __init__(self, per_minute: int, per_hour: int, per_day: int):
+        self.per_minute, self.per_hour, self.per_day = per_minute, per_hour, per_day
+        self.calls: dict[str, deque] = {}
+        self.day: deque = deque()
+        self.lock = threading.Lock()
+
+    def check(self, client: str) -> str | None:
+        now = time.time()
+        with self.lock:
+            while self.day and now - self.day[0] > 86400:
+                self.day.popleft()
+            if len(self.day) >= self.per_day:
+                return "The simulation has reached its daily limit. Try again tomorrow."
+            q = self.calls.setdefault(client, deque())
+            while q and now - q[0] > 3600:
+                q.popleft()
+            if sum(1 for t in q if now - t <= 60) >= self.per_minute or len(q) >= self.per_hour:
+                return "Too many simulations in a short time. Wait a minute and try again."
+            q.append(now)
+            self.day.append(now)
+            if len(self.calls) > 5000:  # forget idle callers
+                for k in [k for k, v in self.calls.items() if not v or now - v[-1] > 3600]:
+                    del self.calls[k]
+            return None
+
+
+LIMITER = RateLimiter(
+    per_minute=int(os.environ.get("SIM_RATE_PER_MINUTE", "10")),
+    per_hour=int(os.environ.get("SIM_RATE_PER_HOUR", "60")),
+    per_day=int(os.environ.get("SIM_RATE_PER_DAY", "500")),
+)
+# One simulation at a time per instance: a second waits briefly, then is told the engine is busy.
+RUNNING = threading.BoundedSemaphore(int(os.environ.get("SIM_PARALLEL", "1")))
 
 # The live Design app's page, open in a browser on this computer, calls the engine
 # directly; so may the local app. No other site may.
@@ -81,8 +130,8 @@ class ActuatorOverride(BaseModel):
 
 class SimulationRequest(BaseModel):
     scenario: Scenario
-    season_length: int
-    seed: int = 0
+    season_length: int = Field(ge=1, le=366)
+    seed: int = Field(0, ge=0, le=2**31 - 1)
     prices: dict[str, float] = Field(default_factory=dict)
     constraints: dict[str, float] = Field(default_factory=dict)
     parameters: dict[str, float] = Field(default_factory=dict)
@@ -97,15 +146,20 @@ class TrainRequest(BaseModel):
     seed: int = 666
 
 
+# Training runs for many minutes in its own process: only on a local engine, never on Cloud Run,
+# where the instance stops computing once the request has been answered.
+TRAINING = not os.environ.get("K_SERVICE") and os.environ.get("SIM_TRAINING", "1") != "0"
+
+
 def _rl_available() -> dict:
     try:
         import sb3_contrib  # noqa: F401
         import stable_baselines3  # noqa: F401
         import torch  # noqa: F401
         import wandb  # noqa: F401
-        return {"available": True}
+        return {"available": True, "training": TRAINING}
     except ImportError as exc:
-        return {"available": False, "reason": f"{exc.name} is not installed (setup.sh --train)."}
+        return {"available": False, "training": False, "reason": f"{exc.name} is not installed (setup.sh --train)."}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -149,7 +203,20 @@ def parameters() -> list[dict]:
 
 
 @app.post("/simulate")
-def run_simulation(req: SimulationRequest) -> dict:
+def run_simulation(req: SimulationRequest, request: Request) -> dict:
+    client = request.headers.get("x-simulation-client") or (request.client.host if request.client else "unknown")
+    limited = LIMITER.check(client)
+    if limited:
+        raise HTTPException(status_code=429, detail=limited)
+    if not RUNNING.acquire(timeout=10):
+        raise HTTPException(status_code=429, detail="The simulation is busy. Try again in a moment.")
+    try:
+        return _run(req)
+    finally:
+        RUNNING.release()
+
+
+def _run(req: SimulationRequest) -> dict:
     cfg = simulate.RunConfig(
         location=req.scenario.location,
         growth_year=req.scenario.growth_year,
@@ -164,6 +231,8 @@ def run_simulation(req: SimulationRequest) -> dict:
     )
     try:
         return simulate.run(cfg, policy_loader=policies.load)
+    except simulate.SimulationTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
     except (simulate.SimulationError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -180,6 +249,8 @@ def rl_jobs() -> list[dict]:
 
 @app.post("/rl/train")
 def rl_train(req: TrainRequest) -> dict[str, Any]:
+    if not TRAINING:
+        raise HTTPException(status_code=403, detail="Training runs only on a local engine.")
     try:
         return training.start(req.algorithm, req.total_timesteps, req.n_envs, req.seed)
     except training.TrainingError as exc:

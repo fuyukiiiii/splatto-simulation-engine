@@ -13,7 +13,9 @@ import gl_gym  # noqa: F401
 from gl_gym.components.rule_based import RuleBasedController
 from gl_gym.core.types import StepContext
 
+from service import app as A
 from service import params as P
+from service import simulate as S
 from service.app import app
 from service.gym2 import rule_based_defaults
 
@@ -35,6 +37,12 @@ def reference_episode():
         costs += info["variable_costs"]
         if te or tr:
             return total, costs, raw.x.copy()
+
+
+@pytest.fixture(autouse=True)
+def roomy_limits(monkeypatch):
+    # The suite runs many simulations from one client; the limit itself has its own test.
+    monkeypatch.setattr(A, "LIMITER", A.RateLimiter(per_minute=1000, per_hour=1000, per_day=1000))
 
 
 @pytest.fixture(scope="module")
@@ -122,3 +130,65 @@ def test_hosted_engine_runs_only_for_the_key(monkeypatch):
     assert client.post("/simulate", json={**DEFAULT, "season_length": 2}).status_code == 401
     assert client.post("/simulate", json={**DEFAULT, "season_length": 2}, headers={"x-simulation-key": "wrong"}).status_code == 401
     assert client.post("/simulate", json={**DEFAULT, "season_length": 2}, headers={"x-simulation-key": "test-key"}).status_code == 200
+
+
+def test_rate_limit_per_caller_and_per_day(monkeypatch):
+    monkeypatch.setattr(A, "LIMITER", A.RateLimiter(per_minute=2, per_hour=60, per_day=3))
+    short = {**DEFAULT, "season_length": 1}
+    assert client.post("/simulate", json=short, headers={"x-simulation-client": "a"}).status_code == 200
+    assert client.post("/simulate", json=short, headers={"x-simulation-client": "a"}).status_code == 200
+    third = client.post("/simulate", json=short, headers={"x-simulation-client": "a"})
+    assert third.status_code == 429 and "Wait a minute" in third.json()["detail"]
+    assert client.post("/simulate", json=short, headers={"x-simulation-client": "b"}).status_code == 200
+    daily = client.post("/simulate", json=short, headers={"x-simulation-client": "c"})
+    assert daily.status_code == 429 and "daily limit" in daily.json()["detail"]
+
+
+def test_busy_engine_answers_429(monkeypatch):
+    import threading
+    monkeypatch.setattr(A, "RUNNING", threading.BoundedSemaphore(1))
+    A.RUNNING.acquire()
+    monkeypatch.setattr(A.RUNNING, "acquire", lambda timeout=None: False)
+    res = client.post("/simulate", json={**DEFAULT, "season_length": 1})
+    assert res.status_code == 429 and "busy" in res.json()["detail"]
+
+
+def test_long_run_stops_at_the_time_limit(monkeypatch):
+    monkeypatch.setattr(S, "TIME_LIMIT_S", 0.0)
+    res = client.post("/simulate", json={**DEFAULT, "season_length": 3})
+    assert res.status_code == 504 and "shorter season" in res.json()["detail"]
+
+
+def test_unbounded_parameter_gets_a_safety_range():
+    # cLeaf has no Gym2 bound; a value 1000x its default is refused, not clamped
+    unbounded = next(p for p in P.catalog() if p["low"] is None and p["high"] is None and p["default"] > 0)
+    res = client.post("/simulate", json={**DEFAULT, "season_length": 1, "parameters": {unbounded["name"]: unbounded["default"] * 1000}})
+    assert res.status_code == 422 and "safe range" in res.json()["detail"]
+
+
+def test_controller_settings_are_bounded():
+    res = client.post("/simulate", json={**DEFAULT, "season_length": 1, "controller": {"type": "rule_based", "settings": {"temp_setpoint_day": 80}}})
+    assert res.status_code == 422 and "Not clamped" in res.json()["detail"]
+    res = client.post("/simulate", json={**DEFAULT, "season_length": 1, "controller": {"type": "rule_based", "settings": {"vent_heat_Pband": 0}}})
+    assert res.status_code == 422
+
+
+def test_seed_and_season_are_validated():
+    assert client.post("/simulate", json={**DEFAULT, "seed": -1}).status_code == 422
+    assert client.post("/simulate", json={**DEFAULT, "season_length": 0}).status_code == 422
+    assert client.post("/simulate", json={**DEFAULT, "season_length": 400}).status_code == 422
+
+
+def test_no_training_when_switched_off(monkeypatch):
+    monkeypatch.setattr(A, "TRAINING", False)
+    assert client.post("/rl/train", json={"algorithm": "ppo", "total_timesteps": 1000}).status_code == 403
+
+
+def test_hosted_engine_refuses_to_start_without_its_key(monkeypatch):
+    import importlib
+    monkeypatch.setenv("K_SERVICE", "splatto-simulation-engine")
+    monkeypatch.delenv("SIM_LAB_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="SIM_LAB_KEY"):
+        importlib.reload(A)
+    monkeypatch.delenv("K_SERVICE")
+    importlib.reload(A)

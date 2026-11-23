@@ -19,6 +19,7 @@ import calendar
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -40,6 +41,23 @@ MAX_SEASON_DAYS = 366
 
 class SimulationError(ValueError):
     pass
+
+
+class SimulationTimeout(SimulationError):
+    """The run reached the wall-clock limit (SIM_TIME_LIMIT_S) and was stopped."""
+
+
+# A run stops after this many seconds, so a request the caller has given up on (the site waits
+# 55 s) does not keep the engine busy. Checked every simulated day.
+TIME_LIMIT_S = float(os.environ.get("SIM_TIME_LIMIT_S", "45"))
+
+# Rule-based settings with a physical meaning get a plausible range; the rest only a generous bound.
+SETTING_RANGES = {
+    "temp_setpoint_day": (5, 35), "temp_setpoint_night": (5, 35), "co2_day": (0, 2000),
+    "lamps_on": (-1, 25), "lamps_off": (-1, 25), "lamps_day_start": (-1, 367), "lamps_day_stop": (-1, 367),
+    "lamps_off_sun": (0, 2000), "lamp_rad_sum_limit": (0, 100), "rh_max": (0, 100), "rhMax": (0, 100),
+    "useBlScr": (0, 1), "heat_deadzone": (0, 30), "t_vent_off": (-30, 30), "thScrSpDay": (-30, 40), "thScrSpNight": (-30, 40),
+}
 
 
 @dataclass
@@ -169,6 +187,11 @@ def _rule_based(settings: dict | None) -> tuple[RuleBasedController, dict]:
         if k not in base:
             raise SimulationError(f"Unknown rule-based setting '{k}'. Supported: {', '.join(base)}.")
         merged[k] = _finite(k, v)
+        lo, hi = SETTING_RANGES.get(k, (-1e4, 1e4))
+        if not (lo <= merged[k] <= hi):
+            raise SimulationError(f"Rule-based setting {k} = {merged[k]:g} is outside {lo:g} to {hi:g}. Not clamped: change the value.")
+        if "band" in k.lower() and merged[k] == 0:
+            raise SimulationError(f"Rule-based setting {k} cannot be 0 (Gym2 divides by it).")
     return RuleBasedController(**merged), merged
 
 
@@ -262,6 +285,11 @@ def run(cfg: RunConfig, policy_loader: Callable[[str], Any] | None = None) -> di
             break
         if terminated or truncated:
             break
+        if steps % 96 == 0 and time.time() - t0 > TIME_LIMIT_S:
+            raise SimulationTimeout(
+                f"The simulation took longer than {TIME_LIMIT_S:g} s and was stopped after {steps * env.dt / 86400:.0f} of "
+                f"{cfg.season_length} days. Try a shorter season."
+            )
     wall = time.time() - t0
 
     return _summarise(env, cfg, scenario, prices, constraints, vector, param_report, controller_info,

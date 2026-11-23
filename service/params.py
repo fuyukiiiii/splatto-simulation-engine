@@ -181,6 +181,21 @@ def _by_name() -> dict[str, dict]:
     return m
 
 
+def _outside_safety_range(default: float, v: float) -> str | None:
+    """
+    Safety range, not physics: within a factor of 100 of GreenLight's default, same sign, so no
+    request can push the solver into extremes that take minutes. Gym2's own bounds come first.
+    Returns the allowed range as text when `v` is outside it.
+    """
+    if default > 0:
+        lo, hi = default / 100, default * 100
+    elif default < 0:
+        lo, hi = default * 100, default / 100
+    else:
+        lo, hi = -1000.0, 1000.0
+    return None if lo <= v <= hi else f"{lo:g} to {hi:g}"
+
+
 def resolve_overrides(raw: dict[str, float] | None) -> tuple[dict[int, float], list[dict]]:
     """Validate overrides by name (GreenLight name or Gym2 registry name). Raises on anything unsupported."""
     raw = raw or {}
@@ -203,6 +218,10 @@ def resolve_overrides(raw: dict[str, float] | None) -> tuple[dict[int, float], l
             raise ParameterError(f"{p['registry_name'] or p['name']} = {v:g} is below Gym2's bound {p['low']:g} {p['unit']}. Not clamped: change the value.")
         if p["high"] is not None and v > p["high"]:
             raise ParameterError(f"{p['registry_name'] or p['name']} = {v:g} is above Gym2's bound {p['high']:g} {p['unit']}. Not clamped: change the value.")
+        if p["low"] is None and p["high"] is None:
+            bad = _outside_safety_range(p["default"], v)
+            if bad:
+                raise ParameterError(f"{p['name']} = {v:g} is outside the safe range {bad} {p['unit']}. Not clamped: change the value.")
         if p["index"] in resolved and resolved[p["index"]] != v:
             raise ParameterError(f"Parameter '{key}' is given twice with different values.")
         resolved[p["index"]] = v
