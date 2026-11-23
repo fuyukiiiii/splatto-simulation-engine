@@ -48,8 +48,9 @@ class SimulationTimeout(SimulationError):
 
 
 # A run stops after this many seconds, so a request the caller has given up on (the site waits
-# 55 s) does not keep the engine busy. Checked every simulated day.
-TIME_LIMIT_S = float(os.environ.get("SIM_TIME_LIMIT_S", "45"))
+# 130 s) does not keep the engine busy. A whole year takes ~62 s on Cloud Run's 1 vCPU.
+# Checked every simulated day.
+TIME_LIMIT_S = float(os.environ.get("SIM_TIME_LIMIT_S", "100"))
 
 # Rule-based settings with a physical meaning get a plausible range; the rest only a generous bound.
 SETTING_RANGES = {
