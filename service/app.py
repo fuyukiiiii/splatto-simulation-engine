@@ -117,8 +117,8 @@ def landing() -> str:
         "<h1 style='font-size:20px'>Splatto Simulation Engine</h1>"
         "<p>The engine behind the Simulation in Splatto Design: GreenLight-Gym2 "
         f"{v['gl_gym_version']} (commit {(v['gym2_commit'] or '')[:7]}), unmodified, AGPL-3.0-or-later.</p>"
-        "<p>Source: <a href='https://github.com/BartvLaatum/GreenLight-Gym2'>GreenLight-Gym2</a> and this service's "
-        "files in its Hugging Face Space.</p></body>"
+        "<p>Source: <a href='https://github.com/fuyukiiiii/splatto-simulation-engine'>this engine</a> and "
+        "<a href='https://github.com/BartvLaatum/GreenLight-Gym2'>GreenLight-Gym2</a>.</p></body>"
     )
 
 
